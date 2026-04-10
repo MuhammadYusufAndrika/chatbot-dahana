@@ -1,0 +1,12 @@
+python-dotenv
+streamlit
+streamlit-option-menu
+st-chat-message
+langchain
+langchain-groq
+langchain-community
+sqlalchemy
+plotly
+pandas
+psycopg2-binary
+prophet
