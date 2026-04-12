@@ -11,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 import plotly.express as px
 import pandas as pd
 from prophet import Prophet
+import serpapi
 
 
 # ===============================
@@ -20,6 +21,11 @@ load_dotenv(override=True)
 api_key = os.getenv("GROQ_API_KEY")
 if not api_key:
     st.error("❌ GROQ_API_KEY tidak ditemukan di .env")
+    st.stop()
+
+serp_api_key = os.getenv("SERP_API_KEY")
+if not serp_api_key:
+    st.error("❌ SERP_API_KEY tidak ditemukan di .env")
     st.stop()
 
 db_url = os.getenv("database_url")
@@ -38,7 +44,7 @@ else:
 # ===============================
 llm = ChatGroq(
     groq_api_key=api_key,
-    model="groq/compound",
+    model="llama-3.1-8b-instant",  # Model terbaru Groq yang direkomendasikan
     temperature=0
 )
 
@@ -63,7 +69,7 @@ Kamu sangat memahami struktur, relasi, serta isi database.
 Tugasmu:
 - Hasilkan query PostgreSQL yang valid, efisien, dan optimal untuk menjawab pertanyaan user.
 - Jangan gunakan format kode atau pembungkus Markdown dalam jawaban. Berikan hanya query SQL dalam bentuk teks biasa, tanpa tanda ``` sql atau format lain.
-- Gunakan best practice SQL (contoh: JOIN dengan ON yang tepat, WHERE untuk filter, GROUP BY & agregasi bila relevan).
+- Gunakan best practice SQL (contoh: JOIN dengan ON yang tepat, WHERE untuk filter, GROUP BY & agregasi bila relevan). BATASI dengan klausa LIMIT (maksimal limit 50) agar data tidak terlalu besar.
 - Jika user meminta data spesifik (bisa jadi user typo), sehingga gunakan LIKE, ILIKE, atau SOUNDEX, dll.
 - Hindari redundansi, subquery yang tidak perlu, dan sintaks yang usang.
 - Jangan berikan jawaban naratif, hanya query PostgreSQL murni.
@@ -99,6 +105,111 @@ Instruksi:
 
 Jawaban:
 """)
+
+# Prompt klasifikasi intent
+intent_classifier_prompt = ChatPromptTemplate.from_template("""
+Kamu adalah router cerdas untuk sistem chatbot perusahaan PT Dahana.
+
+Database perusahaan berisi tabel-tabel berikut:
+{table_info}
+
+Tugasmu: Tentukan apakah pertanyaan user BISA dijawab dari database perusahaan di atas,
+atau harus dicari dari internet.
+
+ATURAN PENTING - Gunakan DATABASE jika:
+- Pertanyaan menyebut nama orang (bisa jadi nama karyawan perusahaan)
+- Pertanyaan tentang karyawan, jabatan, departemen, divisi, unit
+- Pertanyaan tentang absensi, kehadiran, status karyawan
+- Pertanyaan tentang produksi, rencana, realisasi
+- Pertanyaan tentang data internal perusahaan apapun
+- Pertanyaan yang MUNGKIN bisa dijawab dari database (jika ragu pilih DATABASE)
+
+Gunakan WEB hanya jika pertanyaan JELAS tidak mungkin ada di database perusahaan:
+- Definisi atau penjelasan konsep umum (contoh: "apa itu inflasi?", "apa itu bahan peledak?")
+- Sejarah atau profil umum perusahaan (contoh: "kapan PT Dahana didirikan?", "pt dahana adalah")
+- Berita, kejadian eksternal, atau pengetahuan publik umum
+- Pertanyaan yang sama sekali tidak berhubungan dengan data karyawan/produksi/absensi
+
+Contoh:
+- "siapakah abdul latip?" -> DATABASE  (bisa jadi nama karyawan)
+- "info karyawan budi santoso" -> DATABASE
+- "siapa saja karyawan departemen tambang?" -> DATABASE
+- "berapa total produksi bulan ini?" -> DATABASE
+- "bagaimana kehadiran budi santoso?" -> DATABASE
+- "pt dahana adalah" -> WEB
+- "apa itu bahan peledak?" -> WEB
+- "kapan dahana didirikan?" -> WEB
+- "siapa presiden indonesia?" -> WEB
+
+Jika ragu, pilih DATABASE.
+
+Pertanyaan user: {question}
+
+Jawaban (DATABASE/WEB):
+""")
+
+# Prompt fallback dari SerpAPI (Google)
+web_search_prompt = ChatPromptTemplate.from_template("""
+Kamu adalah asisten AI yang membantu menjawab pertanyaan berdasarkan informasi dari internet.
+
+Pertanyaan user:
+{question}
+
+Informasi yang ditemukan dari web:
+{web_results}
+
+Instruksi:
+- Jawab pertanyaan user secara jelas dan informatif berdasarkan informasi yang ditemukan di web.
+- Jangan menyebut bahwa kamu mencari di internet, cukup jawab pertanyaannya.
+- Awali jawaban dengan "Jawaban Web:"
+- Selalu sertakan sumber URL di akhir dengan format "Sumber: [url1, url2, ...]"
+- Jika informasi tidak cukup untuk menjawab, katakan bahwa informasi tidak tersedia.
+
+Jawaban:
+""")
+
+
+# ===============================
+# Fungsi SerpAPI Fallback
+# ===============================
+def search_serp_and_extract(question: str) -> tuple[str, list[str]]:
+    """
+    Cari via SerpAPI dan ekstrak snippet dari ai_overview.text_blocks (paragraf).
+    Jika ai_overview tidak ada, fallback ke organic_results snippets.
+    """
+    client = serpapi.Client(api_key=serp_api_key)
+    results = client.search({
+        "engine": "google",
+        "q": question,
+        "hl": "id",
+        "gl": "id",
+        "num": 5,
+    })
+
+    snippets: list[str] = []
+    urls: list[str] = []
+
+    # ── Prioritas 1: AI Overview paragraphs ──────────────────────────────
+    ai_overview = results.get("ai_overview", {})
+    text_blocks = ai_overview.get("text_blocks", [])
+    for block in text_blocks:
+        if block.get("type") == "paragraph":
+            snippet = block.get("snippet", "").strip()
+            if snippet:
+                snippets.append(snippet)
+
+    # ── Prioritas 2: Organic results (jika tidak ada AI Overview) ─────────
+    if not snippets:
+        for item in results.get("organic_results", [])[:5]:
+            snippet = item.get("snippet", "").strip()
+            link   = item.get("link", "")
+            if snippet:
+                snippets.append(f"[{link}]\n{snippet}" if link else snippet)
+            if link:
+                urls.append(link)
+
+    combined = "\n\n".join(snippets) if snippets else "Tidak ada informasi yang ditemukan."
+    return combined, urls
 
 
 # ===============================
@@ -226,7 +337,7 @@ if selected == "Dashboard":
 
 # --- Halaman Chatbot SuperBrain ---
 elif selected == "Chatbot SuperBrain":
-    st.title("🤖 Dahanalyzer - SuperBrain")
+    st.title("🤖 DahanaChatbot - SuperBrain")
 
     # Inisialisasi chat history
     if "messages" not in st.session_state:
@@ -246,28 +357,63 @@ elif selected == "Chatbot SuperBrain":
         message(pertanyaan, is_user=True, key=f"user_{len(st.session_state['messages'])}")
 
         with st.spinner("🤖 Sedang proses Dahanalyzing..."):
+            use_web_fallback = False
+            response = ""
+
+            # ── Klasifikasi intent terlebih dahulu ───────────────────────
             try:
-                # Generate SQL
-                sql_input = {"table_info": table_info, "question": pertanyaan}
-                raw_output = llm.invoke(sql_prompt.format(**sql_input))
-                sql_query = raw_output.content.split("SQLQuery:")[-1].strip()
+                intent_input = {"table_info": table_info, "question": pertanyaan}
+                intent_raw = llm.invoke(intent_classifier_prompt.format(**intent_input))
+                intent = intent_raw.content.strip().upper()
+                if "WEB" in intent:
+                    use_web_fallback = True
+            except Exception:
+                use_web_fallback = False  # default coba DB dulu jika classifier error
 
-                # Jalankan query
-                result = db.run(sql_query)
+            # ── Path: Database (SQL) ─────────────────────────────────────
+            if not use_web_fallback:
+                try:
+                    # Generate SQL
+                    sql_input = {"table_info": table_info, "question": pertanyaan}
+                    raw_output = llm.invoke(sql_prompt.format(**sql_input))
+                    sql_query = raw_output.content.split("SQLQuery:")[-1].strip()
 
-                # Analisis jawaban
-                analysis_input = {
-                    "question": pertanyaan,
-                    "sql_query": sql_query,
-                    "result": result
-                }
-                jawaban = llm.invoke(analysis_prompt.format(**analysis_input))
+                    # Jalankan query
+                    result = str(db.run(sql_query))
 
-                # response = f"SQL Query: {sql_query}\nHasil Query: {result}\n\n{jawaban.content}"
-                response = jawaban.content
+                    # Jika hasil query kosong, gunakan web fallback
+                    if not result or result.strip() in ("", "[]", "None"):
+                        use_web_fallback = True
+                    else:
+                        # Memotong (truncate) ekstra agresif ke 3000 karakter
+                        if len(result) > 3000:
+                            result = result[:3000] + "... [Hasil terlalu panjang, dipotong untuk API LLM!]"
 
-            except Exception as e:
-                response = f"❌ Error: {e}"
+                        # Analisis jawaban
+                        analysis_input = {
+                            "question": pertanyaan,
+                            "sql_query": sql_query,
+                            "result": result
+                        }
+                        jawaban = llm.invoke(analysis_prompt.format(**analysis_input))
+                        response = jawaban.content
+
+                except Exception:
+                    # SQL gagal → fallback ke web
+                    use_web_fallback = True
+
+            # ── SerpAPI Fallback ──────────────────────────────────────────
+            if use_web_fallback:
+                try:
+                    web_results, urls = search_serp_and_extract(pertanyaan)
+                    web_input = {
+                        "question": pertanyaan,
+                        "web_results": web_results
+                    }
+                    jawaban_web = llm.invoke(web_search_prompt.format(**web_input))
+                    response = jawaban_web.content
+                except Exception as e_web:
+                    response = f"❌ Tidak dapat menemukan jawaban dari database maupun web.\n\nError: {e_web}"
 
         # Simpan jawaban bot
         st.session_state["messages"].append({"role": "assistant", "content": response})
