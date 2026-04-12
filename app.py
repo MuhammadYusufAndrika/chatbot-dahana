@@ -283,55 +283,62 @@ if selected == "Dashboard":
         # Persiapkan data untuk Prophet
         df_forecast = production_data[['date', 'actual_output']].rename(columns={'date': 'ds', 'actual_output': 'y'})
 
-        # Inisialisasi model Prophet
-        model = Prophet()
-        model.fit(df_forecast)
+        # Bersihkan: hapus NaN di kolom ds atau y, konversi ds ke datetime
+        df_forecast['ds'] = pd.to_datetime(df_forecast['ds'], errors='coerce')
+        df_forecast = df_forecast.dropna(subset=['ds', 'y'])
+        df_forecast = df_forecast[df_forecast['y'] > 0]  # buang baris tanpa produksi
 
-        # Buat dataframe untuk prediksi 40 hari ke depan
-        future = model.make_future_dataframe(periods=40)
-        forecast = model.predict(future)
+        if df_forecast.empty or len(df_forecast) < 2:
+            st.info("Data produksi tidak cukup untuk forecast.")
+        else:
+            # Inisialisasi model Prophet
+            model = Prophet()
+            model.fit(df_forecast)
 
-        # Gabungkan hasil forecast ke data historis
-        forecast_data = forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']]
-        forecast_data.columns = ['date', 'forecast_output', 'lower_bound', 'upper_bound']
+            # Buat dataframe untuk prediksi 40 hari ke depan
+            future = model.make_future_dataframe(periods=40)
+            forecast = model.predict(future)
 
-        # Gabungkan data aktual dengan prediksi
-        # Pastikan kolom tanggal dalam format datetime
-        production_data['date'] = pd.to_datetime(production_data['date'])
-        forecast_data['date'] = pd.to_datetime(forecast_data['date'])
+            # Gabungkan hasil forecast ke data historis
+            forecast_data = forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']]
+            forecast_data.columns = ['date', 'forecast_output', 'lower_bound', 'upper_bound']
 
-        # Ambil hanya forecast 40 hari ke depan (setelah data terakhir di database)
-        last_actual_date = production_data['date'].max()
-        future_forecast = forecast_data[forecast_data['date'] > last_actual_date]
+            # Gabungkan data aktual dengan prediksi
+            # Pastikan kolom tanggal dalam format datetime
+            production_data['date'] = pd.to_datetime(production_data['date'])
+            forecast_data['date'] = pd.to_datetime(forecast_data['date'])
 
-        # Gabungkan data historis dengan forecast masa depan
-        merged = pd.concat([production_data, future_forecast], ignore_index=True)
+            # Ambil hanya forecast 40 hari ke depan (setelah data terakhir di database)
+            last_actual_date = production_data['date'].max()
+            future_forecast = forecast_data[forecast_data['date'] > last_actual_date]
 
+            # Gabungkan data historis dengan forecast masa depan
+            merged = pd.concat([production_data, future_forecast], ignore_index=True)
 
-        # Visualisasi menggunakan Plotly
-        production_fig = px.line(
-            merged,
-            x='date',
-            y=['target_output', 'actual_output', 'forecast_output'],
-            title='Total Volume Produksi Harian (dengan Forecast 40 Hari)',
-            labels={'value': 'Output Produksi', 'date': 'Tanggal'},
-        )
+            # Visualisasi menggunakan Plotly
+            production_fig = px.line(
+                merged,
+                x='date',
+                y=['target_output', 'actual_output', 'forecast_output'],
+                title='Total Volume Produksi Harian (dengan Forecast 40 Hari)',
+                labels={'value': 'Output Produksi', 'date': 'Tanggal'},
+            )
 
-        # Warna garis
-        production_fig.update_traces(line=dict(color='green'), selector=dict(name='target_output'))
-        production_fig.update_traces(line=dict(color='orange'), selector=dict(name='actual_output'))
-        production_fig.update_traces(line=dict(color='blue', dash='dot'), selector=dict(name='forecast_output'))
+            # Warna garis
+            production_fig.update_traces(line=dict(color='green'), selector=dict(name='target_output'))
+            production_fig.update_traces(line=dict(color='orange'), selector=dict(name='actual_output'))
+            production_fig.update_traces(line=dict(color='blue', dash='dot'), selector=dict(name='forecast_output'))
 
-        # Tambahkan shading area untuk batas bawah dan atas forecast
-        production_fig.add_traces(px.scatter(
-            forecast_data, x='date', y='upper_bound', opacity=0.1
-        ).data)
-        production_fig.add_traces(px.scatter(
-            forecast_data, x='date', y='lower_bound', opacity=0.1
-        ).data)
+            # Tambahkan shading area untuk batas bawah dan atas forecast
+            production_fig.add_traces(px.scatter(
+                forecast_data, x='date', y='upper_bound', opacity=0.1
+            ).data)
+            production_fig.add_traces(px.scatter(
+                forecast_data, x='date', y='lower_bound', opacity=0.1
+            ).data)
 
-        # Tampilkan grafik
-        st.plotly_chart(production_fig, use_container_width=True)
+            # Tampilkan grafik
+            st.plotly_chart(production_fig, use_container_width=True)
     else:
         st.info("Data produksi tidak tersedia.")
 

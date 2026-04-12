@@ -11,3 +11,5 @@ pandas
 psycopg2-binary
 prophet
 serpapi
+fastapi
+uvicorn
