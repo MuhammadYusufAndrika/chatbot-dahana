@@ -106,7 +106,9 @@ Tugasmu:
 - Hasilkan query PostgreSQL yang valid, efisien, dan optimal untuk menjawab pertanyaan user.
 - Jangan gunakan format kode atau pembungkus Markdown. Berikan hanya query SQL dalam bentuk teks biasa.
 - Gunakan best practice SQL. BATASI dengan LIMIT 50.
-- Gunakan LIKE/ILIKE jika user meminta data spesifik yang mungkin typo.
+- PENTING — PostgreSQL case-sensitive untuk nama kolom yang dibuat dengan huruf kapital: SELALU bungkus nama kolom yang mengandung huruf kapital dengan double-quote. Contoh: "Realisasi", "Tanggal", "Pabrik", "Produk", "Rencana". Jika tidak dibungkus double-quote, PostgreSQL akan konversi ke lowercase dan kolom tidak akan ditemukan.
+- SELALU gunakan ILIKE (bukan =) untuk pencarian teks/nama agar toleran terhadap perbedaan huruf besar/kecil.
+- Untuk pencarian nama orang di tabel karyawan_hcmis, gunakan kolom `ckey` dengan ILIKE. Kolom `ckey` berisi gabungan nama dan tanggal lahir, contoh format: 'Abdul Latip, ST1979-03-06 00:00:00'. Jika user menyebut nama, cukup `ckey ILIKE '%nama%'`.
 - Jangan berikan jawaban naratif, hanya query PostgreSQL murni.
 
 Informasi database:
@@ -176,6 +178,24 @@ Jawaban:
 # ===============================
 # Helpers
 # ===============================
+
+
+# Kapitalized column names in dm_produksi that PostgreSQL requires double-quoted
+_CAPITALIZED_COLS = ["Realisasi", "Tanggal", "Pabrik", "Produk", "Rencana"]
+
+
+def _fix_column_quoting(sql: str) -> str:
+    """
+    Safety net: wrap any unquoted capitalized column names from dm_produksi
+    in double-quotes so PostgreSQL doesn't lowercase them.
+    Skips tokens already inside double-quotes or single-quotes.
+    """
+    for col in _CAPITALIZED_COLS:
+        # Match the column name only when it is NOT already wrapped in double-quotes
+        # and is a word boundary (not part of a larger identifier)
+        pattern = r'(?<!")(\b' + re.escape(col) + r'\b)(?!")'
+        sql = re.sub(pattern, f'"{col}"', sql)
+    return sql
 
 
 def classify_intent(question: str) -> str:
@@ -284,15 +304,33 @@ def ask(question: str) -> dict:
 
     # ── DATABASE: try SQL first ────────────────────────────────────
     if intent == "DATABASE":
+        sql_query = None
+        sql_error = None
         try:
             raw_sql = llm.invoke(
                 sql_prompt.format(table_info=table_info, question=question)
             )
-            sql_query = raw_sql.content.split("SQLQuery:")[-1].strip()
+            # Extract SQL after "SQLQuery:" marker if present, else take full content
+            raw_content = raw_sql.content.strip()
+            if "SQLQuery:" in raw_content:
+                sql_query = raw_content.split("SQLQuery:")[-1].strip()
+            else:
+                sql_query = raw_content
             # Strip any accidental markdown fences
             sql_query = re.sub(r"```[a-z]*\n?", "", sql_query).strip("`").strip()
 
+            print(f"[DEBUG] Intent   : {intent}")
+            print(f"[DEBUG] SQL query: {sql_query}")
+
+            if not sql_query:
+                raise ValueError("LLM menghasilkan SQL kosong")
+
+            # Auto-quote unquoted capitalized column names for dm_produksi
+            sql_query = _fix_column_quoting(sql_query)
+            print(f"[DEBUG] SQL fixed : {sql_query}")
+
             result = format_result_as_table(sql_query)
+            print(f"[DEBUG] Result empty: {not bool(result)}")
 
             if result:
                 jawaban = llm.invoke(
@@ -307,15 +345,17 @@ def ask(question: str) -> dict:
                     "urls": [],
                     "intent": intent,
                 }
-        except Exception:
-            sql_query = None
+        except Exception as e:
+            sql_error = str(e)
+            print(f"[DEBUG] SQL error : {sql_error}")
 
         # DB returned empty or failed → answer from AI knowledge
         jawaban = llm.invoke(ai_knowledge_prompt.format(question=question))
         return {
             "answer": jawaban.content,
             "source": "AI_KNOWLEDGE",
-            "sql_query": sql_query if "sql_query" in dir() else None,
+            "sql_query": sql_query,
+            "sql_error": sql_error,
             "urls": [],
             "intent": intent,
         }

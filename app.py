@@ -271,6 +271,35 @@ elif selected == "Chatbot SuperBrain":
             try:
                 result = chatbot_ask(pertanyaan)
                 response = result["answer"]
+
+                # Debug expander — tampil saat DATABASE atau AI_KNOWLEDGE
+                if result.get("source") in ("DATABASE", "AI_KNOWLEDGE"):
+                    with st.expander(
+                        f"🔍 Debug SQL [{result['source']}]",
+                        expanded=result.get("source") == "AI_KNOWLEDGE",
+                    ):
+                        sql = result.get("sql_query")
+                        err = result.get("sql_error")
+                        if sql:
+                            st.code(sql, language="sql")
+                        else:
+                            st.warning(
+                                "⚠️ SQL tidak berhasil di-generate (LLM kembalikan kosong)."
+                            )
+                        if err:
+                            st.error(f"❌ SQL Error: {err}")
+                        elif sql and result.get("source") == "AI_KNOWLEDGE":
+                            st.info(
+                                "ℹ️ Query berjalan tapi tidak ada data yang cocok di database."
+                            )
+                        elif (
+                            not sql
+                            and not err
+                            and result.get("source") == "AI_KNOWLEDGE"
+                        ):
+                            st.warning(
+                                "⚠️ SQL tidak di-generate dan tidak ada error — cek terminal untuk detail debug."
+                            )
             except Exception as e:
                 response = f"❌ Error: {e}"
 
