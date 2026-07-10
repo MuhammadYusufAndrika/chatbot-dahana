@@ -45,7 +45,7 @@ _db_url_pg = (
 )
 
 # ===============================
-# Init LLM & DB
+# Init LLM
 # ===============================
 llm = ChatGroq(
     groq_api_key=GROQ_API_KEY,
@@ -53,9 +53,29 @@ llm = ChatGroq(
     temperature=0,
 )
 
-db = SQLDatabase.from_uri(_db_url_pg)
-table_info = db.get_table_info()
-engine = create_engine(DATABASE_URL)
+# ===============================
+# Lazy DB Init (connect only when needed)
+# ===============================
+_db = None
+_table_info = None
+_engine = None
+
+
+def _get_db():
+    """Lazily initialize SQLDatabase connection."""
+    global _db, _table_info
+    if _db is None:
+        _db = SQLDatabase.from_uri(_db_url_pg)
+        _table_info = _db.get_table_info()
+    return _db, _table_info
+
+
+def _get_engine():
+    """Lazily initialize SQLAlchemy engine."""
+    global _engine
+    if _engine is None:
+        _engine = create_engine(DATABASE_URL)
+    return _engine
 
 
 # ===============================
@@ -211,7 +231,7 @@ def classify_intent(question: str) -> str:
 
 def format_result_as_table(sql_query: str, max_rows: int = 50) -> str:
     """Run SQL via pandas and return result as Markdown table, or '' if empty."""
-    with engine.connect() as conn:
+    with _get_engine().connect() as conn:
         df = pd.read_sql(text(sql_query), conn)
 
     if df.empty:
@@ -307,6 +327,7 @@ def ask(question: str) -> dict:
         sql_query = None
         sql_error = None
         try:
+            _, table_info = _get_db()
             raw_sql = llm.invoke(
                 sql_prompt.format(table_info=table_info, question=question)
             )

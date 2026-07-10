@@ -4,8 +4,6 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 from dotenv import load_dotenv
-from langchain_community.utilities import SQLDatabase
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
 from prophet import Prophet
 from sqlalchemy import MetaData, Table, create_engine, func
@@ -29,78 +27,94 @@ if not db_url:
     st.error("❌ database_url tidak ditemukan di .env")
     st.stop()
 
-# Jika menggunakan psycopg2, pastikan format URL diawali 'postgresql+psycopg2://'
 if db_url.startswith("postgresql://"):
     db_url_psycopg2 = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
 else:
     db_url_psycopg2 = db_url
 
-# ===============================
-# Init LLM
-# ===============================
-llm = ChatGroq(
-    groq_api_key=api_key,
-    model="llama-3.1-8b-instant",  # Model terbaru Groq yang direkomendasikan
-    temperature=0,
-)
-
-# Init database
-db = SQLDatabase.from_uri(db_url_psycopg2)
-table_info = db.get_table_info()
-
-# Koneksi ke database
-engine = create_engine(db_url)
-
-# Membuat koneksi sesi
-Session = sessionmaker(bind=engine)
-session = Session()
 
 # ===============================
-# Prompt SQL
+# Cached resource init
 # ===============================
-sql_prompt = ChatPromptTemplate.from_template("""
-Kamu adalah seorang **Data Analyst senior** sekaligus **Database Administrator berpengalaman**.
-Kamu sangat memahami struktur, relasi, serta isi database.
+@st.cache_resource
+def get_llm():
+    return ChatGroq(
+        groq_api_key=api_key,
+        model="llama-3.1-8b-instant",
+        temperature=0,
+    )
 
-Tugasmu:
-- Hasilkan query PostgreSQL yang valid, efisien, dan optimal untuk menjawab pertanyaan user.
-- Jangan gunakan format kode atau pembungkus Markdown dalam jawaban. Berikan hanya query SQL dalam bentuk teks biasa, tanpa tanda ``` sql atau format lain.
-- Gunakan best practice SQL (contoh: JOIN dengan ON yang tepat, WHERE untuk filter, GROUP BY & agregasi bila relevan). BATASI dengan klausa LIMIT (maksimal limit 50) agar data tidak terlalu besar.
-- Jika user meminta data spesifik (bisa jadi user typo), sehingga gunakan LIKE, ILIKE, atau SOUNDEX, dll.
-- Hindari redundansi, subquery yang tidak perlu, dan sintaks yang usang.
-- Jangan berikan jawaban naratif, hanya query PostgreSQL murni.
-- Jika butuh menggabungkan tabel, gunakan relasi yang logis sesuai struktur database.
-- Pastikan query bisa langsung dieksekusi tanpa perlu modifikasi tambahan.
 
-Informasi database:
-{table_info}
+@st.cache_resource
+def get_engine():
+    return create_engine(db_url)
 
-Pertanyaan user:
-{question}
 
-SQLQuery:
-""")
+@st.cache_resource
+def get_session(_engine):
+    Session = sessionmaker(bind=_engine)
+    return Session()
 
-# Prompt analisis
-analysis_prompt = ChatPromptTemplate.from_template("""
-Kamu adalah **Data Analyst Profesional** yang sangat berpengalaman dalam analisis data. Tugasmu adalah memberikan analisis mendalam terhadap data yang telah diambil menggunakan query SQL. Jika pertanyaan ini meminta **analisis** atau **penyebab** dalam data, maka kamu harus memberikan analisis yang komprehensif dan interpretatif dengan menggunakan data yang ada.
 
-Berikut adalah informasi yang ada:
-- Pertanyaan: {question}
-- SQL Query yang digunakan: {sql_query}
-- Hasil query dari database: {result}
+llm = get_llm()
+engine = get_engine()
+session = get_session(engine)
 
-Instruksi:
-- Jika pertanyaan hanya meminta data atau informasi tertentu (seperti "tanggal dengan suhu terendah"), jawab dengan hasil query secara langsung tanpa analisis. Jawaban tidak perlu mencakup analisis tren, pola, atau korelasi.
-- Jika pertanyaan meminta untuk analisis (seperti "apa yang menyebabkan suhu rendah pada tanggal tersebut"), maka lakukan analisis tren, pola, atau insight yang dapat diambil dari data tersebut TANPA MEMBUAT KORELASI atau KAUSALITAS. Korelasi atau kausalitas hanya boleh dibuat jika didukung oleh data yang ada, dan user memintanya secara eksplisit.
-- Jika pertanyaan tidak meminta analisis seperti hanya meminta isi data, maka berikan jawaban singkat berdasarkan hasil query.
-- Awali setiap jawaban dengan "Jawaban Analisis:" atau "Jawaban Non-Analisis:" sesuai konteks pertanyaan.
-- Berikan jawaban yang informatif, jelas, mudah dipahami, dan tanpa bertele-tele.
-- Jika data hasil perhitungan/query kamu lebih bagus untuk disajikan dalam bentuk tabel, maka sajikan dalam bentuk tabel.
-- Selalu sertakan sumber data di akhir dengan "Sumber: (data apa saja yang digunakan)".
 
-Jawaban:
-""")
+# ===============================
+# Cached data queries
+# ===============================
+@st.cache_data(ttl=300)
+def get_attendance_data():
+    metadata = MetaData()
+    attendance_table = Table("karyawan_attendance", metadata, autoload_with=engine)
+    attendance_query = (
+        session.query(
+            attendance_table.c.date,
+            attendance_table.c.status,
+            func.count(attendance_table.c.nip).label("count"),
+        )
+        .group_by(attendance_table.c.date, attendance_table.c.status)
+        .order_by(attendance_table.c.date)
+    )
+    return pd.read_sql(attendance_query.statement, engine)
+
+
+@st.cache_data(ttl=300)
+def get_production_data():
+    metadata = MetaData()
+    production_table = Table("dm_produksi", metadata, autoload_with=engine)
+    production_query = (
+        session.query(
+            production_table.c.Tanggal.label("date"),
+            func.sum(production_table.c.Rencana).label("target_output"),
+            func.sum(production_table.c.Realisasi).label("actual_output"),
+        )
+        .group_by(production_table.c.Tanggal)
+        .order_by(production_table.c.Tanggal)
+    )
+    return pd.read_sql(production_query.statement, engine)
+
+
+@st.cache_data(ttl=3600)
+def get_production_forecast(production_data_json: str):
+    production_data = pd.read_json(production_data_json)
+    df_forecast = production_data[["date", "actual_output"]].rename(
+        columns={"date": "ds", "actual_output": "y"}
+    )
+    df_forecast["ds"] = pd.to_datetime(df_forecast["ds"])
+    df_forecast = df_forecast.dropna(subset=["ds", "y"])
+
+    model = Prophet()
+    model.fit(df_forecast)
+
+    future = model.make_future_dataframe(periods=40)
+    forecast = model.predict(future)
+
+    forecast_data = forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]].copy()
+    forecast_data.columns = ["date", "forecast_output", "lower_bound", "upper_bound"]
+    return forecast_data
+
 
 
 # ===============================
@@ -125,24 +139,11 @@ with st.sidebar:
 # --- Halaman Dashboard ---
 if selected == "Dashboard":
     st.title("📊 Dahanalyzer - Dashboard")
-    metadata = MetaData()
 
     # VISUALISASI ABSENSI KARYAWAN
     st.subheader("Kehadiran Karyawan")
-    attendance_table = Table("karyawan_attendance", metadata, autoload_with=engine)
 
-    # Query mengelompokkan jumlah karyawan berdasarkan tanggal dan status
-    attendance_query = (
-        session.query(
-            attendance_table.c.date,
-            attendance_table.c.status,
-            func.count(attendance_table.c.nip).label("count"),
-        )
-        .group_by(attendance_table.c.date, attendance_table.c.status)
-        .order_by(attendance_table.c.date)
-    )
-
-    attendance_data = pd.read_sql(attendance_query.statement, engine)
+    attendance_data = get_attendance_data()
 
     if not attendance_data.empty:
         attendance_fig = px.bar(
@@ -159,56 +160,18 @@ if selected == "Dashboard":
 
     # VISUALISASI PRODUKSI
     st.subheader("Prediksi & Realisasi Produksi")
-    production_table = Table("dm_produksi", metadata, autoload_with=engine)
 
-    # Karena ada kolom Pabrik/Produk, kita agregatkan dulu per Tanggal agar Prophet bisa membaca time-series dengan baik
-    production_query = (
-        session.query(
-            production_table.c.Tanggal.label("date"),
-            func.sum(production_table.c.Rencana).label("target_output"),
-            func.sum(production_table.c.Realisasi).label("actual_output"),
-        )
-        .group_by(production_table.c.Tanggal)
-        .order_by(production_table.c.Tanggal)
-    )
-
-    production_data = pd.read_sql(production_query.statement, engine)
+    production_data = get_production_data()
 
     if not production_data.empty:
-        # Persiapkan data untuk Prophet
-        df_forecast = production_data[["date", "actual_output"]].rename(
-            columns={"date": "ds", "actual_output": "y"}
-        )
-        df_forecast["ds"] = pd.to_datetime(df_forecast["ds"])
-        df_forecast = df_forecast.dropna(subset=["ds", "y"])
-
-        # Inisialisasi model Prophet
-        model = Prophet()
-        model.fit(df_forecast)
-
-        # Buat dataframe untuk prediksi 40 hari ke depan
-        future = model.make_future_dataframe(periods=40)
-        forecast = model.predict(future)
-
-        # Gabungkan hasil forecast ke data historis
-        forecast_data = forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]]
-        forecast_data.columns = [
-            "date",
-            "forecast_output",
-            "lower_bound",
-            "upper_bound",
-        ]
-
-        # Gabungkan data aktual dengan prediksi
-        # Pastikan kolom tanggal dalam format datetime
         production_data["date"] = pd.to_datetime(production_data["date"])
+
+        forecast_data = get_production_forecast(production_data.to_json())
         forecast_data["date"] = pd.to_datetime(forecast_data["date"])
 
-        # Ambil hanya forecast 40 hari ke depan (setelah data terakhir di database)
         last_actual_date = production_data["date"].max()
         future_forecast = forecast_data[forecast_data["date"] > last_actual_date]
 
-        # Gabungkan data historis dengan forecast masa depan
         merged = pd.concat([production_data, future_forecast], ignore_index=True)
 
         # Visualisasi menggunakan Plotly

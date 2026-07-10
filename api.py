@@ -11,11 +11,14 @@ Interactive docs (auto-generated):
     http://localhost:8000/redoc     ← ReDoc UI
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional
 import chatbot_core as core
+import os
+
+API_KEY = os.getenv("API_KEY", "")
 
 # ===============================
 # App
@@ -75,6 +78,16 @@ class HealthResponse(BaseModel):
     version: str
 
 
+def verify_api_key(x_api_key: str = Header(default="", alias="X-API-Key")):
+    if not API_KEY:
+        return
+    if x_api_key != API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing API key",
+        )
+
+
 # ===============================
 # Routes
 # ===============================
@@ -106,6 +119,7 @@ def health():
     summary="Ask a Question",
     tags=["Chatbot"],
     responses={
+        401: {"description": "Unauthorized – missing or invalid API key"},
         200: {
             "description": "Successful response",
             "content": {
@@ -137,7 +151,7 @@ def health():
         500: {"description": "Internal server error"},
     },
 )
-def chat(request: ChatRequest):
+def chat(request: ChatRequest, _: None = Depends(verify_api_key)):
     """
     **Main chatbot endpoint.**
 

@@ -10,10 +10,10 @@
 | Feature | Description |
 |---|---|
 | 📊 **Dashboard** | Real-time employee attendance chart + production forecast (Prophet) |
-| 🤖 **SuperBrain Chatbot** | Ask anything in natural language — answered from DB or the web |
-| 🔍 **Smart Intent Routing** | LLM classifier decides DB vs. web automatically |
+| 🤖 **SuperBrain Chatbot** | Ask anything in natural language — answered from DB, AI knowledge, or the web |
+| 🔍 **Smart Intent Routing** | LLM classifier routes to **RAG**, **DATABASE**, or **GENERAL** automatically |
 | 🗄️ **SQL Agent** | Generates & runs PostgreSQL queries on the fly |
-| 🌐 **Google Fallback** | Uses SerpAPI (AI Overview) when data isn't in the database |
+| 🌐 **Google Fallback** | Uses SerpAPI (AI Overview) for general questions not related to company data |
 | 🔌 **REST API** | FastAPI backend so any app can call the chatbot |
 
 ---
@@ -44,19 +44,29 @@ User question
       ▼
 Intent Classifier (LLM)
       │
+      ├── RAG ──────► LLM answers using Dahana persona & general knowledge
+      │
       ├── DATABASE ──► Generate SQL ──► Run on DB ──► LLM analysis
       │                                      │
-      │                               Empty result?
+      │                               Empty / Error?
       │                                      │ YES
-      └── WEB ◄────────────────────────────-┘
-            │
-            ▼
-       SerpAPI Search
-       (AI Overview paragraphs → organic snippets fallback)
-            │
-            ▼
-       LLM composes answer
+      │                                      ▼
+      │                              AI Knowledge fallback
+      │                              (LLM answers from general knowledge)
+      │
+      └── GENERAL ──► SerpAPI Search
+                      (AI Overview paragraphs → organic snippets fallback)
+                            │
+                            ▼
+                       LLM composes answer
 ```
+
+**Intent categories:**
+| Intent | When used |
+|---|---|
+| `RAG` | Greetings, chatbot identity, general info about PT Dahana |
+| `DATABASE` | Questions requiring internal company data (employees, attendance, production) |
+| `GENERAL` | General knowledge questions not related to company data |
 
 ---
 
@@ -129,27 +139,45 @@ Open → `http://localhost:8000/docs` for interactive Swagger UI
 ## 🔌 REST API
 
 ### Base URL
-```
+```text
 http://localhost:8000
 ```
 
-### Endpoints
+### Authentication
+API ini memakai header `X-API-Key`.
 
-#### `GET /health`
-Check that the API server is running.
-
-```bash
-curl http://localhost:8000/health
+Contoh:
+```http
+X-API-Key: your-secret-api-key
 ```
 
+Set environment variable di server:
+```env
+API_KEY=your-secret-api-key
+```
+
+### Headers
+```http
+Content-Type: application/json
+X-API-Key: your-secret-api-key
+```
+
+### Endpoint
+
+#### `GET /health`
+Cek apakah server API aktif.
+
+**Auth:** tidak perlu
+
+**Contoh respons**
 ```json
 { "status": "ok", "version": "1.0.0" }
 ```
 
----
-
 #### `POST /chat`
-Send a question, get a natural-language answer.
+Mengirim pertanyaan ke chatbot dan menerima jawaban natural language.
+
+**Auth:** wajib `X-API-Key`
 
 **Request body**
 ```json
@@ -158,7 +186,13 @@ Send a question, get a natural-language answer.
 }
 ```
 
-**Response — answered from database**
+**Field request**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `question` | `string` | Ya | Pertanyaan untuk chatbot, Bahasa Indonesia atau Inggris |
+
+**Contoh respons — dari database**
 ```json
 {
   "answer": "Jawaban Non-Analisis: Abdul Latip, ST menjabat sebagai Senior Manajer...",
@@ -168,7 +202,7 @@ Send a question, get a natural-language answer.
 }
 ```
 
-**Response — answered from web**
+**Contoh respons — dari web**
 ```json
 {
   "answer": "Jawaban Web: PT Dahana adalah Badan Usaha Milik Negara (BUMN)...",
@@ -178,16 +212,47 @@ Send a question, get a natural-language answer.
 }
 ```
 
-**Response fields**
+**Field respons**
 
 | Field | Type | Description |
 |---|---|---|
-| `answer` | `string` | Natural-language answer |
-| `source` | `"DATABASE"` \| `"WEB"` | Where the answer came from |
-| `sql_query` | `string \| null` | SQL used (only for DATABASE answers) |
-| `urls` | `string[]` | Source links (only for WEB answers) |
+| `answer` | `string` | Jawaban utama chatbot |
+| `source` | `"DATABASE"` \| `"WEB"` \| `"RAG"` \| `"AI_KNOWLEDGE"` | Sumber jawaban |
+| `sql_query` | `string \| null` | Query SQL yang dipakai, hanya untuk `DATABASE` / `AI_KNOWLEDGE` |
+| `urls` | `string[]` | Daftar URL referensi, hanya untuk `WEB` |
 
-### Code examples
+**Nilai `source`:**
+| Value | Arti |
+|---|---|
+| `DATABASE` | Jawaban dibangun dari hasil query ke database internal |
+| `RAG` | Jawaban dibangun dari pengetahuan chatbot tentang PT Dahana |
+| `AI_KNOWLEDGE` | Jawaban dari pengetahuan umum LLM (DB tidak menemukan data) |
+| `WEB` | Jawaban dibangun dari hasil pencarian Google via SerpAPI |
+
+### Cara pakai dari website lain
+
+**JavaScript / Frontend**
+```javascript
+async function askChatbot(question) {
+  const res = await fetch("http://localhost:8000/chat", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-API-Key": "your-secret-api-key",
+    },
+    body: JSON.stringify({ question }),
+  });
+
+  if (!res.ok) {
+    throw new Error("Gagal mengambil jawaban dari chatbot");
+  }
+
+  return await res.json();
+}
+
+const result = await askChatbot("berapa total produksi bulan ini?");
+console.log(result.answer);
+```
 
 **Python**
 ```python
@@ -195,28 +260,48 @@ import requests
 
 resp = requests.post(
     "http://localhost:8000/chat",
+    headers={"X-API-Key": "your-secret-api-key"},
     json={"question": "berapa total produksi bulan ini?"}
 )
 print(resp.json()["answer"])
-```
-
-**JavaScript**
-```javascript
-const res = await fetch("http://localhost:8000/chat", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ question: "siapa karyawan departemen keuangan?" }),
-});
-const data = await res.json();
-console.log(data.answer);
 ```
 
 **cURL**
 ```bash
 curl -X POST http://localhost:8000/chat \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret-api-key" \
   -d '{"question": "pt dahana adalah"}'
 ```
+
+### Catatan integrasi frontend
+- Jika website lain berbeda domain, pastikan CORS di `api.py` mengizinkan domain tersebut.
+- Endpoint yang paling penting untuk ditampilkan di website lain adalah `POST /chat`.
+- Jika ingin hanya menampilkan jawaban chatbot, gunakan field `answer`.
+- Jika ingin menampilkan sumber, gunakan `source` dan `urls`.
+
+### Example flow
+1. Frontend mengirim `question` ke `POST /chat`
+2. API mengembalikan `answer`, `source`, dan metadata tambahan
+3. Frontend menampilkan `answer` ke user
+4. Jika `source = WEB`, frontend bisa menampilkan daftar `urls`
+
+### Health check
+```bash
+curl http://localhost:8000/health
+``` 
+
+---
+
+### Minimal response shape
+```json
+{
+  "answer": "...",
+  "source": "DATABASE",
+  "sql_query": null,
+  "urls": []
+}
+``` 
 
 ---
 
@@ -242,7 +327,8 @@ curl -X POST http://localhost:8000/chat \
   ```python
   allow_origins=["https://your-app.com"]
   ```
-- Consider adding API key authentication to the `/chat` endpoint before exposing it publicly.
+- API key authentication via `X-API-Key` header is **already implemented** on the `/chat` endpoint. Set `API_KEY` in `.env` to enable it. If `API_KEY` is empty, authentication is bypassed (useful for local development).
+- Consider using HTTPS in production to protect API keys in transit.
 
 ---
 
