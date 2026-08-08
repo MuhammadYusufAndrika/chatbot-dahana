@@ -27,10 +27,11 @@ if not db_url:
     st.error("❌ database_url tidak ditemukan di .env")
     st.stop()
 
-if db_url.startswith("postgresql://"):
-    db_url_psycopg2 = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
-else:
-    db_url_psycopg2 = db_url
+# Normalise driver so SQLAlchemy can connect (mysql → pymysql, postgres → psycopg2)
+if db_url.startswith("mysql://") and "+pymysql" not in db_url:
+    db_url = db_url.replace("mysql://", "mysql+pymysql://", 1)
+elif db_url.startswith("postgresql://") and "+" not in db_url.split("://")[0]:
+    db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
 
 
 # ===============================
@@ -166,7 +167,7 @@ if selected == "Dashboard":
     if not production_data.empty:
         production_data["date"] = pd.to_datetime(production_data["date"])
 
-        forecast_data = get_production_forecast(production_data.to_json())
+        forecast_data = get_production_forecast(production_data.to_json(date_format="iso"))
         forecast_data["date"] = pd.to_datetime(forecast_data["date"])
 
         last_actual_date = production_data["date"].max()

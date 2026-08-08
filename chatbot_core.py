@@ -38,11 +38,22 @@ if not SERP_API_KEY:
 if not DATABASE_URL:
     raise RuntimeError("database_url tidak ditemukan di .env")
 
-_db_url_pg = (
-    DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
-    if DATABASE_URL.startswith("postgresql://")
-    else DATABASE_URL
-)
+# Normalise the URL so SQLAlchemy has the correct driver.
+# MySQL:  mysql://… → mysql+pymysql://…
+# PgSQL:  postgresql://… → postgresql+psycopg2://…
+def _normalize_db_url(url: str) -> str:
+    if url.startswith("mysql://") and "+pymysql" not in url:
+        return url.replace("mysql://", "mysql+pymysql://", 1)
+    if url.startswith("postgresql://") and "+" not in url.split("://")[0]:
+        return url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    return url
+
+
+_db_url = _normalize_db_url(DATABASE_URL)
+
+# Dialect detection (used to pick the right SQL typo/style rules)
+_IS_MYSQL = _db_url.startswith("mysql")
+_IS_POSTGRES = _db_url.startswith("postgresql")
 
 # ===============================
 # Init LLM
@@ -65,7 +76,7 @@ def _get_db():
     """Lazily initialize SQLDatabase connection."""
     global _db, _table_info
     if _db is None:
-        _db = SQLDatabase.from_uri(_db_url_pg)
+        _db = SQLDatabase.from_uri(_db_url)
         _table_info = _db.get_table_info()
     return _db, _table_info
 
@@ -74,7 +85,7 @@ def _get_engine():
     """Lazily initialize SQLAlchemy engine."""
     global _engine
     if _engine is None:
-        _engine = create_engine(DATABASE_URL)
+        _engine = create_engine(_db_url)
     return _engine
 
 
@@ -87,7 +98,7 @@ intent_prompt = ChatPromptTemplate.from_template("""
 Kamu adalah classifier yang sangat akurat. Tugasmu adalah mengklasifikasikan pertanyaan user ke dalam salah satu kategori berikut:
 
 - RAG      : Pertanyaan non-teknis seperti salam, identitas AI, pertanyaan tentang chatbot ini, atau pertanyaan tentang PT Dahana secara umum (sejarah, profil, bisnis, dll). Contoh: "halo", "siapa kamu", "apa itu PT Dahana", "kamu bisa apa".
-- DATABASE : Pertanyaan yang membutuhkan data dari database internal (data karyawan, absensi, produksi, gaji, dll). Contoh: "berapa karyawan yang hadir minggu ini", "siapa yang tidak masuk hari ini", "total produksi bulan lalu".
+- DATABASE : Pertanyaan yang membutuhkan data dari database internal (data karyawan, absensi, produksi, produk/katalog, dll). Contoh: "berapa karyawan yang hadir minggu ini", "siapa yang tidak masuk hari ini", "total produksi bulan lalu", "produk apa saja yang tersedia", "berapa harga produk AR Headset".
 - GENERAL  : Pertanyaan umum yang tidak berkaitan dengan database internal maupun identitas chatbot PT Dahana. Contoh: "apa itu machine learning", "siapa presiden Indonesia", "harga saham hari ini".
 
 Pertanyaan user:
@@ -108,6 +119,7 @@ Profil singkat PT DAHANA:
 Kemampuanmu:
 - Menjawab pertanyaan seputar PT Dahana dan operasional perusahaan.
 - Menganalisis data karyawan, absensi, dan produksi dari database internal.
+- Menjelaskan produk/katalog yang ditampilkan di katalog AR.
 - Memberikan insight berbasis data untuk mendukung pengambilan keputusan.
 
 Jawab pertanyaan berikut dengan ramah, profesional, dan informatif dalam bahasa Indonesia:
@@ -123,13 +135,14 @@ Kamu adalah seorang **Data Analyst senior** sekaligus **Database Administrator b
 Kamu sangat memahami struktur, relasi, serta isi database.
 
 Tugasmu:
-- Hasilkan query PostgreSQL yang valid, efisien, dan optimal untuk menjawab pertanyaan user.
+- Hasilkan query MySQL yang valid, efisien, dan optimal untuk menjawab pertanyaan user.
 - Jangan gunakan format kode atau pembungkus Markdown. Berikan hanya query SQL dalam bentuk teks biasa.
 - Gunakan best practice SQL. BATASI dengan LIMIT 50.
-- PENTING — PostgreSQL case-sensitive untuk nama kolom yang dibuat dengan huruf kapital: SELALU bungkus nama kolom yang mengandung huruf kapital dengan double-quote. Contoh: "Realisasi", "Tanggal", "Pabrik", "Produk", "Rencana". Jika tidak dibungkus double-quote, PostgreSQL akan konversi ke lowercase dan kolom tidak akan ditemukan.
-- SELALU gunakan ILIKE (bukan =) untuk pencarian teks/nama agar toleran terhadap perbedaan huruf besar/kecil.
-- Untuk pencarian nama orang di tabel karyawan_hcmis, gunakan kolom `ckey` dengan ILIKE. Kolom `ckey` berisi gabungan nama dan tanggal lahir, contoh format: 'Abdul Latip, ST1979-03-06 00:00:00'. Jika user menyebut nama, cukup `ckey ILIKE '%nama%'`.
-- Jangan berikan jawaban naratif, hanya query PostgreSQL murni.
+- PENTING — Dialek database adalah MySQL. Gunakan `LIKE` (bukan `ILIKE`, karena ILIKE hanya ada di PostgreSQL) untuk pencarian teks/nama yang toleran terhadap besar kecil huruf. MySQL kolasi default (mis. utf8mb4_general_ci) sudah case-insensitive.
+- Nama kolom yang berada di MySQL bisa langsung dipakai tanpa double-quote. Jika ada nama kolom yang bentrok dengan kata kunci MySQL, bungkus dengan backtick (`), mis. `metadata`.
+- Untuk pertanyaan tentang produk/katalog (website GLB-AR), gunakan tabel `products` (kolom: product_id, product_name, description, model_url, poster_url, category, metadata, view_count, ar_activation_count, is_active).
+- Untuk pencarian nama orang di tabel karyawan_hcmis, gunakan kolom `ckey` dengan LIKE. Kolom `ckey` berisi gabungan nama dan tanggal lahir, contoh format: 'Abdul Latip, ST1979-03-06 00:00:00'. Jika user menyebut nama, cukup `ckey LIKE '%nama%'`.
+- Jangan berikan jawaban naratif, hanya query MySQL murni.
 
 Informasi database:
 {table_info}
@@ -200,16 +213,21 @@ Jawaban:
 # ===============================
 
 
-# Kapitalized column names in dm_produksi that PostgreSQL requires double-quoted
+# Kapitalized column names in dm_produksi were previously double-quoted
+# for PostgreSQL. MySQL is case-insensitive for column names, so this
+# safety-net is only applied when the target dialect is PostgreSQL.
 _CAPITALIZED_COLS = ["Realisasi", "Tanggal", "Pabrik", "Produk", "Rencana"]
 
 
 def _fix_column_quoting(sql: str) -> str:
     """
-    Safety net: wrap any unquoted capitalized column names from dm_produksi
-    in double-quotes so PostgreSQL doesn't lowercase them.
+    Safety net (PostgreSQL only): wrap unquoted capitalized column names from
+    dm_produksi in double-quotes so PostgreSQL doesn't lowercase them.
     Skips tokens already inside double-quotes or single-quotes.
+    For MySQL this is intentionally a no-op (double quotes are string literals).
     """
+    if not _IS_POSTGRES:
+        return sql
     for col in _CAPITALIZED_COLS:
         # Match the column name only when it is NOT already wrapped in double-quotes
         # and is a word boundary (not part of a larger identifier)
