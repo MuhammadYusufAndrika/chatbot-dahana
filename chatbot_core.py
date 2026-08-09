@@ -98,7 +98,8 @@ intent_prompt = ChatPromptTemplate.from_template("""
 Kamu adalah classifier yang sangat akurat. Tugasmu adalah mengklasifikasikan pertanyaan user ke dalam salah satu kategori berikut:
 
 - RAG      : Pertanyaan non-teknis seperti salam, identitas AI, pertanyaan tentang chatbot ini, atau pertanyaan tentang PT Dahana secara umum (sejarah, profil, bisnis, dll). Contoh: "halo", "siapa kamu", "apa itu PT Dahana", "kamu bisa apa".
-- DATABASE : Pertanyaan yang membutuhkan data dari database internal (data karyawan, absensi, produksi, produk/katalog, dll). Contoh: "berapa karyawan yang hadir minggu ini", "siapa yang tidak masuk hari ini", "total produksi bulan lalu", "produk apa saja yang tersedia", "berapa harga produk AR Headset".
+- DATABASE : Pertanyaan yang membutuhkan data dari database internal (data karyawan, absensi, produksi, produk/katalog, knowledge produk, dll). Contoh: "berapa karyawan yang hadir minggu ini", "siapa yang tidak masuk hari ini", "total produksi bulan lalu", "produk apa saja yang tersedia", "berapa harga produk AR Headset", "apa yang kamu ketahui tentang AR Headset Pro", "modern office chair adalah".
+- PENTING — Jika pertanyaan menyebutkan NAMA PRODUK atau katalog (mis. "kursi kantor", "smart home speaker", "AR Headset"), maka PASTIKAN masuk kategori DATABASE, bukan RAG/GENERAL.
 - GENERAL  : Pertanyaan umum yang tidak berkaitan dengan database internal maupun identitas chatbot PT Dahana. Contoh: "apa itu machine learning", "siapa presiden Indonesia", "harga saham hari ini".
 
 Pertanyaan user:
@@ -141,6 +142,7 @@ Tugasmu:
 - PENTING — Dialek database adalah MySQL. Gunakan `LIKE` (bukan `ILIKE`, karena ILIKE hanya ada di PostgreSQL) untuk pencarian teks/nama yang toleran terhadap besar kecil huruf. MySQL kolasi default (mis. utf8mb4_general_ci) sudah case-insensitive.
 - Nama kolom yang berada di MySQL bisa langsung dipakai tanpa double-quote. Jika ada nama kolom yang bentrok dengan kata kunci MySQL, bungkus dengan backtick (`), mis. `metadata`.
 - Untuk pertanyaan tentang produk/katalog (website GLB-AR), gunakan tabel `products` (kolom: product_id, product_name, description, model_url, poster_url, category, metadata, view_count, ar_activation_count, is_active).
+- Untuk pertanyaan tentang pengetahuan/info tambahan produk yang diisi admin (knowledge base), gunakan tabel `product_knowledge` (kolom: id, product_id, title, content, is_active). `product_id` menghubungkan ke tabel `products` (NULL = knowledge umum). Gabungkan dengan tabel `products` via product_id bila perlu, mis. untuk memfilter knowledge milik produk tertentu.
 - Untuk pencarian nama orang di tabel karyawan_hcmis, gunakan kolom `ckey` dengan LIKE. Kolom `ckey` berisi gabungan nama dan tanggal lahir, contoh format: 'Abdul Latip, ST1979-03-06 00:00:00'. Jika user menyebut nama, cukup `ckey LIKE '%nama%'`.
 - Jangan berikan jawaban naratif, hanya query MySQL murni.
 
@@ -247,6 +249,39 @@ def classify_intent(question: str) -> str:
     return "GENERAL"
 
 
+def _mentions_known_product(question: str) -> bool:
+    """
+    Check if the question mentions a known product (product_name or a
+    knowledge entry title). Used as a safety net so questions about catalog
+    products are always routed to the DATABASE path, even if the LLM
+    classifier mislabels them as RAG/GENERAL.
+    """
+    try:
+        q = question.lower().strip()
+        with _get_engine().connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT product_name FROM products WHERE is_active = 1 "
+                    "UNION "
+                    "SELECT title FROM product_knowledge WHERE is_active = 1"
+                )
+            ).fetchall()
+        for (name,) in rows:
+            if name and name.lower() in q:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _resolve_intent(question: str) -> str:
+    """Classify intent, with a database lookup safety net for product names."""
+    intent = classify_intent(question)
+    if intent in ("RAG", "GENERAL") and _mentions_known_product(question):
+        return "DATABASE"
+    return intent
+
+
 def format_result_as_table(sql_query: str, max_rows: int = 50) -> str:
     """Run SQL via pandas and return result as Markdown table, or '' if empty."""
     with _get_engine().connect() as conn:
@@ -327,7 +362,7 @@ def ask(question: str) -> dict:
         GENERAL  → SerpAPI web search
     """
 
-    intent = classify_intent(question)
+    intent = _resolve_intent(question)
 
     # ── RAG: non-technical / identity / about Dahana ──────────────
     if intent == "RAG":

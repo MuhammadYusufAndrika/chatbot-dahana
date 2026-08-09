@@ -1,16 +1,18 @@
 -- =========================================================================
 -- setup_mysql_chatbot.sql
--- Setup the MySQL `chatbot` database used by the chatbot.
--- Creates the `products` table (same schema as the GLB-AR Laravel app) and
--- seeds it with the sample products from GLB-AR's ProductSeeder.
+-- Setup the MySQL database used by the chatbot.
+-- Since the `chatbot` and `glb-3d` databases were merged, everything lives in
+-- `glb-3d` (the database shared with the GLB-AR website).
+-- Creates the `products` table (same schema as the GLB-AR Laravel app),
+-- seeds it with the sample products, and creates the `product_knowledge` table.
 --
 -- Assumes MySQL is running locally and user `root` has no password.
 --
 -- Run:
---   mysql -u root -p chatbot < setup_mysql_chatbot.sql
+--   mysql -u root -p glb-3d < setup_mysql_chatbot.sql
 -- =========================================================================
 
-USE chatbot;
+USE glb-3d;
 
 CREATE TABLE IF NOT EXISTS products (
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -52,3 +54,20 @@ VALUES
      'https://modelviewer.dev/shared-assets/models/Astronaut.glb', NULL, 'Technology',
      JSON_OBJECT('display', 'Dual 4K OLED', 'field_of_view', '110 degrees', 'tracking', '6DoF + Hand Tracking', 'battery', '4 hours'),
      0, 0, 1, NOW(), NOW());
+
+-- -------------------------------------------------------------------------
+-- Product knowledge base (managed from the GLB-AR admin panel)
+--   * product_id → link to products.product_id (NULL = free-form / general)
+--   * title      → short title of the knowledge entry
+--   * content    → the knowledge text the chatbot uses
+-- -------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS product_knowledge (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    product_id VARCHAR(255) NULL,
+    title VARCHAR(255) NOT NULL,
+    content TEXT NOT NULL,
+    is_active TINYINT(1) NOT NULL DEFAULT 1,
+    created_at TIMESTAMP NULL,
+    updated_at TIMESTAMP NULL,
+    INDEX idx_product_id (product_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
