@@ -130,6 +130,30 @@ Pertanyaan: {question}
 Jawaban:
 """)
 
+# --- 2b. RAG grounded with web search (factual Dahana questions) ---
+rag_web_prompt = ChatPromptTemplate.from_template("""
+Kamu adalah **DahanaBot SuperBrain**, asisten AI cerdas milik **PT DAHANA (Persero)**.
+
+Profil singkat PT DAHANA:
+- PT DAHANA (Persero) adalah perusahaan BUMN Indonesia yang bergerak di bidang bahan peledak (handak) dan solusi pertahanan.
+- Berdiri sejak 1966, berlokasi di Subang, Jawa Barat.
+- Melayani sektor pertambangan, migas, konstruksi, dan pertahanan nasional.
+
+Instruksi:
+- Jawab pertanyaan user dengan ramah, profesional, dan informatif dalam bahasa Indonesia.
+- Gunakan **hanya** informasi dari hasil pencarian web di bawah ini untuk menjawab.
+- Jika informasi web tidak cukup untuk menjawab, katakan dengan jujur bahwa informasi tidak tersedia; jangan menambahkan fakta dari pengetahuan sendiri.
+- Jangan menyebutkan bahwa kamu melakukan pencarian web; cukup jawab seolah itu pengetahuan DahanaBot.
+- Selalu akhiri jawaban dengan daftar sumber: "Sumber: [url1, url2, ...]".
+
+Pertanyaan: {question}
+
+Hasil pencarian web:
+{web_results}
+
+Jawaban:
+""")
+
 # --- 3. SQL generation ---
 sql_prompt = ChatPromptTemplate.from_template("""
 Kamu adalah seorang **Data Analyst senior** sekaligus **Database Administrator berpengalaman**.
@@ -171,6 +195,27 @@ Instruksi:
 - Berikan jawaban yang informatif, jelas, dan mudah dipahami dalam bahasa Indonesia.
 - Jika data lebih bagus disajikan dalam tabel, sajikan dalam tabel Markdown.
 - Selalu sertakan sumber data di akhir dengan "Sumber: (data apa saja yang digunakan)".
+
+Jawaban:
+""")
+
+# --- 4b. Product info answer (product mentioned in question) ---
+product_info_prompt = ChatPromptTemplate.from_template("""
+Kamu adalah asisten virtual situs GLB-AR. User bertanya tentang produk yang ada di katalog.
+
+Pertanyaan user: {question}
+
+Informasi produk dari database:
+{product_info}
+
+Instruksi:
+- Jawab dengan bahasa Indonesia yang jelas, informatif, dan ramah.
+- Sampaikan **deskripsi produk** secara rapi dan ringkas sebagai jawaban utamanya.
+- Jika ada spesifikasi/metadata tambahan, sebutkan.
+- Jika ada pengetahuan tambahan dari admin, gunakan untuk memperkaya jawaban.
+- Jangan menambahkan informasi produk yang tidak tercantum di data yang diberikan.
+- Awali jawaban dengan "Jawaban Produk:".
+- Akhiri dengan "Sumber: Katalog produk GLB-AR".
 
 Jawaban:
 """)
@@ -238,6 +283,26 @@ def _fix_column_quoting(sql: str) -> str:
     return sql
 
 
+# Phrases that are pure smalltalk / chatbot identity — no web search needed.
+_SMALLTALK_PATTERNS = (
+    "halo", "hallo", "hai", "hi", "hello", "selamat pagi", "selamat siang",
+    "selamat sore", "selamat malam", "apa kabar", "siapa kamu", "siapa anda",
+    "kamu bisa apa", "kamu bisa bantu", "terima kasih", "makasih", "thanks",
+    "thank you", "bye", "dadah", "sampai jumpa",
+)
+
+
+def _is_smalltalk(question: str) -> bool:
+    """True for greetings / chatbot-identity questions that don't need web search."""
+    q = question.lower().strip()
+    if q in _SMALLTALK_PATTERNS:
+        return True
+    # Containment for longer phrasing (e.g. "halo bot", "siapa namamu")
+    if any(p in q for p in ("siapa kamu", "siapa anda", "kamu bisa apa", "kamu adalah", "namamu")):
+        return True
+    return False
+
+
 def classify_intent(question: str) -> str:
     """Return 'RAG', 'DATABASE', or 'GENERAL'."""
     raw = llm.invoke(intent_prompt.format(question=question))
@@ -249,6 +314,39 @@ def classify_intent(question: str) -> str:
     return "GENERAL"
 
 
+def _match_product_name(question: str) -> str | None:
+    """
+    Find a product whose name is mentioned in the question, using tolerant
+    word-token matching (handles minor typos like "Chairr" vs "Chair").
+    Returns the exact product_name stored in the database, or None.
+    """
+    q_words = set(re.findall(r"[a-z0-9]+", question.lower()))
+    try:
+        with _get_engine().connect() as conn:
+            rows = conn.execute(
+                text("SELECT product_name FROM products WHERE is_active = 1")
+            ).fetchall()
+    except Exception:
+        return None
+
+    best = None
+    best_score = 0
+    for (name,) in rows:
+        if not name:
+            continue
+        name_words = [
+            w for w in re.findall(r"[a-z0-9]+", name.lower()) if len(w) > 2
+        ]
+        if not name_words:
+            continue
+        score = sum(1 for w in name_words if w in q_words)
+        # Require a majority of the product's significant words to be present
+        if score > best_score and score >= max(1, (len(name_words) + 1) // 2):
+            best_score = score
+            best = name
+    return best
+
+
 def _mentions_known_product(question: str) -> bool:
     """
     Check if the question mentions a known product (product_name or a
@@ -256,30 +354,123 @@ def _mentions_known_product(question: str) -> bool:
     products are always routed to the DATABASE path, even if the LLM
     classifier mislabels them as RAG/GENERAL.
     """
+    if _match_product_name(question):
+        return True
     try:
         q = question.lower().strip()
         with _get_engine().connect() as conn:
             rows = conn.execute(
-                text(
-                    "SELECT product_name FROM products WHERE is_active = 1 "
-                    "UNION "
-                    "SELECT title FROM product_knowledge WHERE is_active = 1"
-                )
+                text("SELECT title FROM product_knowledge WHERE is_active = 1")
             ).fetchall()
-        for (name,) in rows:
-            if name and name.lower() in q:
+        for (title,) in rows:
+            if title and title.lower() in q:
                 return True
         return False
     except Exception:
         return False
 
 
+def _is_definitional(question: str) -> bool:
+    """True for 'what/how/why' definitional questions (apa itu, pengertian, ...)."""
+    q = question.lower()
+    words = (
+        "apa itu", "apa", "pengertian", "definisi", "siapa", "bagaimana",
+        "mengapa", "kenapa", "jelaskan", "maksud", "perbedaan",
+    )
+    return any(w in q for w in words)
+
+
 def _resolve_intent(question: str) -> str:
     """Classify intent, with a database lookup safety net for product names."""
     intent = classify_intent(question)
+
+    # Product explicitly mentioned in catalog → always DATABASE (SQL / product info).
     if intent in ("RAG", "GENERAL") and _mentions_known_product(question):
         return "DATABASE"
+
+    # Definitional question about Dahana (e.g. "apa itu bulk emulsi") that does
+    # NOT match a known catalog product → route to web-grounded RAG instead of
+    # running SQL against the catalog. Otherwise the SQL agent returns irrelevant
+    # rows (e.g. a random product) and the analysis step gets confused.
+    if intent == "DATABASE" and not _mentions_known_product(question) and _is_definitional(question):
+        return "RAG"
+
     return intent
+
+
+def _find_product_in_question(question: str) -> str | None:
+    """Return the product_name from the `products` table that appears in the question."""
+    return _match_product_name(question)
+
+
+def _fetch_product_info(product_name: str) -> dict | None:
+    """Fetch the product row (id, name, description, category, metadata)."""
+    try:
+        with _get_engine().connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT product_id, product_name, description, category, metadata "
+                    "FROM products WHERE product_name = :name AND is_active = 1 LIMIT 1"
+                ),
+                {"name": product_name},
+            ).mappings().first()
+        return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def _fetch_product_knowledge(product_name: str) -> list[dict]:
+    """Fetch admin-provided knowledge entries linked to a product."""
+    try:
+        with _get_engine().connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT pk.title, pk.content "
+                    "FROM product_knowledge pk "
+                    "JOIN products p ON p.product_id = pk.product_id "
+                    "WHERE p.product_name LIKE :name AND pk.is_active = 1"
+                ),
+                {"name": f"%{product_name}%"},
+            ).fetchall()
+        return [{"title": r[0], "content": r[1]} for r in rows]
+    except Exception:
+        return []
+
+
+# Words that indicate a numeric/analytics question about a product.
+# For these, the chatbot should NOT answer from the static product info,
+# but let the SQL agent compute the answer instead.
+_ANALYTICS_WORDS = (
+    "berapa",
+    "jumlah",
+    "total",
+    "hitung",
+    "statistik",
+    "count",
+    "persen",
+    "rata-rata",
+    "terbanyak",
+    "tertinggi",
+    "terendah",
+    "view",
+    "dilihat",
+    "aktivasi",
+    "sering",
+)
+
+
+def _format_product_info(info: dict, knowledge: list[dict]) -> str:
+    """Format product data + knowledge into a readable text for the LLM."""
+    lines = [f"Nama Produk: {info.get('product_name') or '-'}"]
+    lines.append(f"Deskripsi: {info.get('description') or '-'}")
+    if info.get("category"):
+        lines.append(f"Kategori: {info['category']}")
+    if info.get("metadata"):
+        lines.append(f"Spesifikasi: {info['metadata']}")
+    if knowledge:
+        knowledge_text = " ".join(k["content"] for k in knowledge)
+        lines.append(f"Pengetahuan tambahan (dari admin): {knowledge_text}")
+    return "\n".join(lines)
 
 
 def format_result_as_table(sql_query: str, max_rows: int = 50) -> str:
@@ -349,7 +540,7 @@ def ask(question: str) -> dict:
     Process a question and return:
     {
         "answer":    str,
-        "source":    "RAG" | "DATABASE" | "AI_KNOWLEDGE" | "WEB",
+        "source":    "RAG" | "DATABASE" | "PRODUCT" | "AI_KNOWLEDGE" | "WEB",
         "sql_query": str | None,
         "urls":      list[str],
         "intent":    str,
@@ -366,17 +557,69 @@ def ask(question: str) -> dict:
 
     # ── RAG: non-technical / identity / about Dahana ──────────────
     if intent == "RAG":
-        jawaban = llm.invoke(rag_prompt.format(question=question))
-        return {
-            "answer": jawaban.content,
-            "source": "RAG",
-            "sql_query": None,
-            "urls": [],
-            "intent": intent,
-        }
+        # Pure smalltalk / chatbot identity → answer from persona only.
+        # Skipping web search here saves SERP API quota and latency.
+        if _is_smalltalk(question):
+            jawaban = llm.invoke(rag_prompt.format(question=question))
+            return {
+                "answer": jawaban.content,
+                "source": "RAG",
+                "sql_query": None,
+                "urls": [],
+                "intent": intent,
+            }
+
+        # Factual Dahana question → ground the answer with SERP API so it is
+        # based on real web sources instead of the LLM's own (hallucinated) memory.
+        try:
+            web_results, urls = search_serp_and_extract(question)
+            jawaban = llm.invoke(
+                rag_web_prompt.format(question=question, web_results=web_results)
+            )
+            return {
+                "answer": jawaban.content,
+                "source": "WEB",
+                "sql_query": None,
+                "urls": urls,
+                "intent": intent,
+            }
+        except Exception as e:
+            print(f"[DEBUG] RAG web search failed, falling back to persona: {e}")
+            # Fallback to persona-only answer if SERP is unavailable / errors.
+            jawaban = llm.invoke(rag_prompt.format(question=question))
+            return {
+                "answer": jawaban.content,
+                "source": "RAG",
+                "sql_query": None,
+                "urls": [],
+                "intent": intent,
+            }
 
     # ── DATABASE: try SQL first ────────────────────────────────────
     if intent == "DATABASE":
+        # Product-based questions: answer directly from the product info
+        # (description + admin knowledge) when a catalog product is mentioned,
+        # unless the question is asking for numbers/analytics.
+        matched_product = _find_product_in_question(question)
+        if matched_product and not any(w in question.lower() for w in _ANALYTICS_WORDS):
+            info = _fetch_product_info(matched_product)
+            if info:
+                knowledge = _fetch_product_knowledge(matched_product)
+                product_info = _format_product_info(info, knowledge)
+                print(f"[DEBUG] Product answer for: {matched_product}")
+                jawaban = llm.invoke(
+                    product_info_prompt.format(
+                        question=question, product_info=product_info
+                    )
+                )
+                return {
+                    "answer": jawaban.content,
+                    "source": "PRODUCT",
+                    "sql_query": None,
+                    "urls": [],
+                    "intent": intent,
+                }
+
         sql_query = None
         sql_error = None
         try:
