@@ -60,7 +60,7 @@ _IS_POSTGRES = _db_url.startswith("postgresql")
 # ===============================
 llm = ChatGroq(
     groq_api_key=GROQ_API_KEY,
-    model="llama-3.1-8b-instant",
+    model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
     temperature=0,
 )
 

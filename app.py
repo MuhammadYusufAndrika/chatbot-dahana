@@ -41,7 +41,7 @@ elif db_url.startswith("postgresql://") and "+" not in db_url.split("://")[0]:
 def get_llm():
     return ChatGroq(
         groq_api_key=api_key,
-        model="llama-3.1-8b-instant",
+        model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
         temperature=0,
     )
 
