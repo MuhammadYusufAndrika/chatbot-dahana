@@ -134,17 +134,20 @@ Jawaban:
 rag_web_prompt = ChatPromptTemplate.from_template("""
 Kamu adalah **DahanaBot SuperBrain**, asisten AI cerdas milik **PT DAHANA (Persero)**.
 
-Profil singkat PT DAHANA:
+Profil dasar PT DAHANA (boleh dipakai bila web tidak lengkap):
 - PT DAHANA (Persero) adalah perusahaan BUMN Indonesia yang bergerak di bidang bahan peledak (handak) dan solusi pertahanan.
-- Berdiri sejak 1966, berlokasi di Subang, Jawa Barat.
+- Berdiri sejak 1966 (Proyek Angkatan Udara RI di Tasikmalaya), menjadi Perum 1973, menjadi PT (Persero) 1991.
+- Kantor pusat / Energetic Material Center di Subang, Jawa Barat.
 - Melayani sektor pertambangan, migas, konstruksi, dan pertahanan nasional.
 
 Instruksi:
 - Jawab pertanyaan user dengan ramah, profesional, dan informatif dalam bahasa Indonesia.
-- Gunakan **hanya** informasi dari hasil pencarian web di bawah ini untuk menjawab.
-- Jika informasi web tidak cukup untuk menjawab, katakan dengan jujur bahwa informasi tidak tersedia; jangan menambahkan fakta dari pengetahuan sendiri.
+- UTAMAKAN bagian "[AI Overview Google]" dari hasil pencarian di bawah — itu ringkasan resmi Google.
+- Bila AI Overview menjawab pertanyaan, sampaikan jawabannya dengan bahasa yang rapi (jangan copy-paste mentah).
+- Bila web tidak lengkap, lengkapi dengan Profil dasar di atas.
+- Jangan menolak menjawab bila AI Overview / profil dasar sudah cukup.
 - Jangan menyebutkan bahwa kamu melakukan pencarian web; cukup jawab seolah itu pengetahuan DahanaBot.
-- Selalu akhiri jawaban dengan daftar sumber: "Sumber: [url1, url2, ...]".
+- Selalu akhiri jawaban dengan daftar sumber: "Sumber: [url1, url2, ...]" memakai URL dari hasil pencarian.
 
 Pertanyaan: {question}
 
@@ -242,11 +245,11 @@ Kamu adalah asisten AI yang membantu menjawab pertanyaan berdasarkan informasi d
 Pertanyaan user:
 {question}
 
-Informasi yang ditemukan dari web:
+Informasi yang ditemukan dari web (bagian [AI Overview Google] adalah ringkasan resmi Google — utamakan itu):
 {web_results}
 
 Instruksi:
-- Jawab pertanyaan user secara jelas dan informatif berdasarkan informasi yang ditemukan.
+- Jawab pertanyaan user secara jelas dan informatif berdasarkan informasi yang ditemukan, utamakan AI Overview.
 - Awali jawaban dengan "Jawaban Web:"
 - Selalu sertakan sumber URL di akhir dengan format "Sumber: [url1, url2, ...]"
 - Jika informasi tidak cukup, katakan bahwa informasi tidak tersedia.
@@ -372,12 +375,16 @@ def _mentions_known_product(question: str) -> bool:
 
 def _is_definitional(question: str) -> bool:
     """True for 'what/how/why' definitional questions (apa itu, pengertian, ...)."""
+    import re as _re
     q = question.lower()
-    words = (
-        "apa itu", "apa", "pengertian", "definisi", "siapa", "bagaimana",
-        "mengapa", "kenapa", "jelaskan", "maksud", "perbedaan",
+    patterns = (
+        r"\bapa itu\b", r"\bapa\b", r"\bpengertian\b", r"\bdefinisi\b",
+        r"\bsiapa\b", r"\bbagaimana\b", r"\bmengapa\b", r"\bkenapa\b",
+        r"\bjelaskan\b", r"\bmaksud\b", r"\bperbedaan\b",
+        r"\bkapan\b", r"\btahun berapa\b", r"\bberapa\b",
+        r"\bberdiri\b", r"\bsejarah\b", r"\bdimana\b", r"\bdi mana\b",
     )
-    return any(w in q for w in words)
+    return any(_re.search(p, q) for p in patterns)
 
 
 def _resolve_intent(question: str) -> str:
@@ -493,41 +500,132 @@ def format_result_as_table(sql_query: str, max_rows: int = 50) -> str:
     return df.to_markdown(index=False)
 
 
+def _format_ai_overview_blocks(text_blocks: list) -> str:
+    """Format SerpAPI ai_overview.text_blocks (paragraph/heading/list) jadi teks rapi.
+
+    Contoh struktur per dokumentasi SerpAPI:
+      {"type": "paragraph", "snippet": "...", ...}
+      {"type": "heading", "snippet": "..."}
+      {"type": "list", "list": [{"title": "...", "snippet": "..."}, ...]}
+    """
+    parts: list[str] = []
+    for block in text_blocks or []:
+        btype = block.get("type")
+        if btype == "paragraph":
+            s = (block.get("snippet") or "").strip()
+            if s:
+                parts.append(s)
+        elif btype == "heading":
+            s = (block.get("snippet") or "").strip()
+            if s:
+                parts.append(f"\n## {s}")
+        elif btype == "list":
+            for item in block.get("list") or []:
+                title = (item.get("title") or "").strip()
+                snippet = (item.get("snippet") or "").strip()
+                if title and snippet:
+                    parts.append(f"- {title} {snippet}".strip())
+                elif snippet:
+                    parts.append(f"- {snippet}")
+                elif title:
+                    parts.append(f"- {title}")
+    return "\n\n".join(parts).strip()
+
+
+def _fetch_ai_overview(question: str, page_token: str) -> tuple[str, list[str]]:
+    """Fetch expanded Google AI Overview via engine=google_ai_overview.
+
+    Returns (formatted_text, reference_urls). Empty string bila gagal.
+    """
+    if not page_token:
+        return "", []
+    try:
+        client = serpapi.Client(api_key=SERP_API_KEY)
+        expanded = client.search(
+            {"engine": "google_ai_overview", "page_token": page_token}
+        )
+        aio = expanded.get("ai_overview", {}) or {}
+        text = _format_ai_overview_blocks(aio.get("text_blocks", []))
+        urls: list[str] = []
+        for ref in aio.get("references", []) or []:
+            link = (ref.get("link") or "").strip()
+            if link and link not in urls:
+                urls.append(link)
+        return text, urls
+    except Exception as e:
+        print(f"[DEBUG] AI Overview fetch failed: {e}")
+        return "", []
+
+
 def search_serp_and_extract(question: str) -> tuple[str, list[str]]:
-    """Search via SerpAPI, return (combined_snippets, list_of_urls)."""
+    """Search via SerpAPI (Google + Google AI Overview), return (combined, urls).
+
+    Alur sesuai dokumentasi SerpAPI:
+      1. GET search.json engine=google -> ambil ai_overview.page_token + organic.
+      2. GET engine=google_ai_overview page_token -> ambil
+         ai_overview.text_blocks (paragraph/heading/list) + references.
+      3. Gabung: [AI Overview Google] + [Hasil Organik] + answer_box/knowledge_graph.
+    """
+    # NOTE: jangan pakai "location":"Indonesia" — parameter itu membuat
+    # engine google_ai_overview mengembalikan text_blocks=None (kosong).
+    # Cukup hl/gl untuk hasil Indonesia.
+    # Perkaya query Dahana agar AI Overview muncul konsisten.
+    q = question.strip()
+    if "dahana" in q.lower() and "pt dahana" not in q.lower():
+        q = q + " PT DAHANA Persero"
     client = serpapi.Client(api_key=SERP_API_KEY)
     results = client.search(
         {
             "engine": "google",
-            "q": question,
-            "location": "Indonesia",
+            "q": q,
             "hl": "id",
             "gl": "id",
             "num": 5,
         }
     )
 
-    snippets: list[str] = []
+    sections: list[str] = []
     urls: list[str] = []
 
-    ai_overview = results.get("ai_overview", {})
-    for block in ai_overview.get("text_blocks", []):
-        if block.get("type") == "paragraph":
-            s = block.get("snippet", "").strip()
-            if s:
-                snippets.append(s)
+    # ── 1. Google AI Overview (2-step: page_token -> expanded) ──
+    ai_text, ai_urls = "", []
+    try:
+        page_token = (results.get("ai_overview", {}) or {}).get("page_token", "")
+        if page_token:
+            ai_text, ai_urls = _fetch_ai_overview(question, page_token)
+    except Exception as e:
+        print(f"[DEBUG] AI Overview step failed: {e}")
+    if ai_text:
+        sections.append("[AI Overview Google]\n" + ai_text)
+        for u in ai_urls:
+            if u not in urls:
+                urls.append(u)
 
-    if not snippets:
-        for item in results.get("organic_results", [])[:5]:
-            s = item.get("snippet", "").strip()
-            link = item.get("link", "")
-            if s:
-                snippets.append(f"[{link}]\n{s}" if link else s)
-            if link:
-                urls.append(link)
+    # ── 2. Answer box / Knowledge graph (bila ada, sering akurat utk fakta) ──
+    for key in ("answer_box", "knowledge_graph"):
+        box = results.get(key, {}) or {}
+        if isinstance(box, dict):
+            for field in ("answer", "snippet", "description", "title"):
+                val = (box.get(field) or "")
+                if isinstance(val, str) and val.strip():
+                    sections.append(f"[{key}]\n{val.strip()}")
+                    break
+
+    # ── 3. Organic results (pelengkap + sumber) ──
+    organic_lines: list[str] = []
+    for item in results.get("organic_results", [])[:5]:
+        s = (item.get("snippet") or "").strip()
+        link = (item.get("link") or "").strip()
+        title = (item.get("title") or "").strip()
+        if s:
+            organic_lines.append(f"- {title} [{link}]\n  {s}" if link else f"- {s}")
+        if link and link not in urls:
+            urls.append(link)
+    if organic_lines:
+        sections.append("[Hasil Organik]\n" + "\n".join(organic_lines))
 
     combined = (
-        "\n\n".join(snippets) if snippets else "Tidak ada informasi yang ditemukan."
+        "\n\n".join(sections) if sections else "Tidak ada informasi yang ditemukan."
     )
     return combined, urls
 

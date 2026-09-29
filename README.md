@@ -93,6 +93,7 @@ PoC_Dahanalyzer/
 
 ---
 
+
 ## 🚀 Getting Started
 
 ### 1. Clone the repository
@@ -129,6 +130,7 @@ Open → `http://localhost:8501`
 
 ```bash
 uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+php artisan serve --host=127.0.0.1 --port=8001
 ```
 Open → `http://localhost:8000/docs` for interactive Swagger UI
 
